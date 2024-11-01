@@ -146,8 +146,36 @@ modules:
     cleanup:
       - '*'
 
+  - name: vulkan-headers
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/KhronosGroup/Vulkan-Headers.git
+        tag: v1.3.300
+    cleanup:
+      - /share/vulkan/registry
+
+  - name: vulkan-loader
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_SKIP_RPATH:BOOL=yes
+      - -DBUILD_TESTS=OFF
+      - -DBUILD_WSI_XCB_SUPPORT=On
+      - -DBUILD_WSI_XLIB_SUPPORT=On
+      - -DBUILD_WSI_WAYLAND_SUPPORT=On
+
+    sources:
+      - type: git
+        url: https://github.com/KhronosGroup/Vulkan-Loader.git
+        tag: v1.3.300
+    cleanup:
+      - /lib/cmake/VulkanLoader
+
   - name: wivrn
     buildsystem: cmake-ninja
+    build-options:
+      env:
+        VULKAN_SDK: /app
     config-opts:
       - -DCMAKE_BUILD_TYPE=RelWithDebInfo
       - -DWIVRN_BUILD_CLIENT=OFF
@@ -165,6 +193,7 @@ modules:
       - -DGIT_DESC=WIVRN_GIT_DESC
       - -DGIT_COMMIT=WIVRN_GIT_COMMIT
       - -Wno-dev
+      - -DCMAKE_PREFIX_PATH=${FLATPAK_DEST}
     sources:
       - WIVRN_SRC1
         WIVRN_SRC2
@@ -202,6 +231,8 @@ modules:
       - type: script
         dest-filename: launch-wivrn-dashboard.sh
         commands:
+          - export VK_DRIVER_FILES=/usr/lib/$(uname -m)-linux-gnu/GL/vulkan/icd.d
+          -
           - if [ -f $XDG_CONFIG_HOME/openvr/openvrpaths.vrpath ]
           - then
           -         mv $XDG_CONFIG_HOME/openvr/openvrpaths.vrpath $XDG_CONFIG_HOME/openvrpaths.vrpath-backup
