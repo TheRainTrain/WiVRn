@@ -21,10 +21,8 @@
 
 #include "utils/sync_queue.h"
 #include "wivrn_packets.h"
-#include <functional>
 #include <memory>
 #include <span>
-#include <thread>
 #include <unordered_map>
 
 #include <media/NdkImage.h>
@@ -59,6 +57,7 @@ class stream;
 
 namespace wivrn::android
 {
+class media_codec_access;
 class decoder
 {
 public:
@@ -84,6 +83,7 @@ public:
 	};
 
 private:
+	std::shared_ptr<media_codec_access> jobs;
 	wivrn::to_headset::video_stream_description::item description;
 	uint8_t stream_index;
 	float fps;
@@ -118,17 +118,15 @@ private:
 
 	utils::sync_queue<input_buffer> input_buffers;
 	input_buffer current_input_buffer; // Only accessed in network thread
-	utils::sync_queue<std::function<bool(void)>> jobs;
 
 	struct frame_info
 	{
-		wivrn::from_headset::feedback feedback;
+		std::shared_ptr<wivrn::from_headset::feedback> feedback;
 		wivrn::to_headset::video_stream_data_shard::timing_info_t timing_info;
 		wivrn::to_headset::video_stream_data_shard::view_info_t view_info;
 	};
 	utils::sync_queue<frame_info> frame_infos;
 
-	std::thread worker;
 	static void on_media_error(AMediaCodec *, void * userdata, media_status_t error, int32_t actionCode, const char * detail);
 	static void on_media_format_changed(AMediaCodec *, void * userdata, AMediaFormat *);
 	static void on_media_input_available(AMediaCodec *, void * userdata, int32_t index);

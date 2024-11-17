@@ -77,6 +77,165 @@ void check(media_status_t status, const char * msg)
 namespace wivrn::android
 {
 
+class media_codec_access
+{
+	struct input_job
+	{
+		std::shared_ptr<wivrn::from_headset::feedback> feedback;
+		AMediaCodec * media_codec;
+		size_t buffer_idx;
+		size_t data_size;
+		uint64_t frame_index;
+	};
+	struct output_job
+	{
+		AMediaCodec * media_codec;
+		size_t buffer_idx;
+	};
+	std::mutex mutex;
+	std::condition_variable cv;
+	bool exit_request = false;
+	std::deque<input_job> input_jobs;
+	std::deque<output_job> output_jobs;
+	std::thread input;
+	std::thread output;
+
+	media_codec_access();
+
+public:
+	~media_codec_access();
+	static std::shared_ptr<media_codec_access> get();
+	void stop(AMediaCodec *);
+
+	// schedule a call to AMediaCodec_queueInputBuffer
+	void push_input(
+	        std::shared_ptr<wivrn::from_headset::feedback> feedback,
+	        AMediaCodec * media_codec,
+	        size_t buffer_idx,
+	        size_t data_size,
+	        uint64_t frame_index);
+	// schedule a call to AMediaCodec_releaseOutputBuffer
+	void push_output(
+	        AMediaCodec * media_codec,
+	        size_t buffer_idx);
+};
+
+media_codec_access::media_codec_access()
+{
+	input = utils::named_thread(
+	        "queueInputBuffer",
+	        [this]() {
+		        while (true)
+		        {
+			        std::unique_lock lock(mutex);
+			        if (exit_request)
+				        return;
+			        if (input_jobs.empty())
+				        cv.wait(lock);
+			        if (not input_jobs.empty())
+			        {
+				        auto job = input_jobs.front();
+				        input_jobs.pop_front();
+				        lock.unlock();
+
+				        if (exit_request)
+					        return;
+				        job.feedback->sent_to_decoder = application::now();
+				        auto status = AMediaCodec_queueInputBuffer(
+				                job.media_codec,
+				                job.buffer_idx,
+				                0,
+				                job.data_size,
+				                job.frame_index * 10'000,
+				                0);
+				        if (status != AMEDIA_OK)
+					        spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
+					                      int(status),
+					                      std::string(magic_enum::enum_name(status)).c_str());
+			        }
+		        }
+	        });
+	output = utils::named_thread(
+	        "releaseOutputBuffer",
+	        [this]() {
+		        while (true)
+		        {
+			        std::unique_lock lock(mutex);
+			        if (exit_request)
+				        return;
+			        if (output_jobs.empty())
+				        cv.wait(lock);
+			        if (not output_jobs.empty())
+			        {
+				        auto job = output_jobs.front();
+				        output_jobs.pop_front();
+				        lock.unlock();
+
+				        auto status = AMediaCodec_releaseOutputBuffer(job.media_codec, job.buffer_idx, true);
+				        // will trigger on_image_available through ImageReader
+				        if (status != AMEDIA_OK)
+					        spdlog::error("AMediaCodec_releaseOutputBuffer: MediaCodec error {}({})",
+					                      int(status),
+					                      std::string(magic_enum::enum_name(status)).c_str());
+			        }
+		        }
+	        });
+}
+
+media_codec_access::~media_codec_access()
+{
+	{
+		std::unique_lock lock(mutex);
+		input_jobs.clear();
+		output_jobs.clear();
+		exit_request = true;
+		cv.notify_all();
+	}
+	output.join();
+	input.join();
+}
+
+std::shared_ptr<media_codec_access> media_codec_access::get()
+{
+	static std::weak_ptr<media_codec_access> instance;
+	static std::mutex m;
+	std::unique_lock lock(m);
+	auto s = instance.lock();
+	if (s)
+		return s;
+	s.reset(new media_codec_access);
+	instance = s;
+	return s;
+}
+
+void media_codec_access::stop(AMediaCodec * media_codec)
+{
+	std::unique_lock lock(mutex);
+	std::erase_if(input_jobs, [=](auto & j) { return j.media_codec == media_codec; });
+	std::erase_if(output_jobs, [=](auto & j) { return j.media_codec == media_codec; });
+}
+
+void media_codec_access::push_input(
+        std::shared_ptr<wivrn::from_headset::feedback> feedback,
+        AMediaCodec * media_codec,
+        size_t buffer_idx,
+        size_t data_size,
+        uint64_t frame_index)
+{
+	std::unique_lock lock(mutex);
+	input_jobs.emplace_back(feedback, media_codec, buffer_idx, data_size, frame_index);
+	cv.notify_all();
+}
+
+void media_codec_access::push_output(
+        AMediaCodec * media_codec,
+        size_t buffer_idx)
+{
+	std::unique_lock lock(mutex);
+	output_jobs.emplace_back(media_codec, buffer_idx);
+	cv.notify_all();
+}
+
 decoder::decoder(
         vk::raii::Device & device,
         vk::raii::PhysicalDevice & physical_device,
@@ -85,7 +244,13 @@ decoder::decoder(
         uint8_t stream_index,
         std::weak_ptr<scenes::stream> weak_scene,
         shard_accumulator * accumulator) :
-        description(description), stream_index(stream_index), fps(fps), device(device), weak_scene(weak_scene), accumulator(accumulator)
+        jobs(media_codec_access::get()),
+        description(description),
+        stream_index(stream_index),
+        fps(fps),
+        device(device),
+        weak_scene(weak_scene),
+        accumulator(accumulator)
 {
 	spdlog::info("hbm_mutex.native_handle() = {}", (void *)hbm_mutex.native_handle());
 
@@ -144,26 +309,6 @@ decoder::decoder(
 
 		check(AMediaCodec_start(media_codec.get()), "AMediaCodec_start");
 	}
-	worker = utils::named_thread(
-	        "decoder-" + std::to_string(stream_index),
-	        [this]() {
-		        while (true)
-		        {
-			        try
-			        {
-				        if (jobs.pop()())
-					        return;
-			        }
-			        catch (const utils::sync_queue_closed & e)
-			        {
-				        return;
-			        }
-			        catch (const std::exception & e)
-			        {
-				        spdlog::error("error in decoder thread: {}", e.what());
-			        }
-		        }
-	        });
 }
 
 decoder::~decoder()
@@ -171,16 +316,9 @@ decoder::~decoder()
 	if (media_codec)
 	{
 		AMediaCodec_stop(media_codec.get());
-		jobs.push([]() { return true; });
-		if (worker.joinable())
-			worker.join();
+		jobs->stop(media_codec.get());
 	}
 	input_buffers.close();
-	jobs.close();
-
-	if (worker.joinable())
-		worker.join();
-
 	spdlog::info("decoder::~decoder");
 }
 
@@ -206,20 +344,6 @@ void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame
 		memcpy(current_input_buffer.data + current_input_buffer.data_size, sub_data.data(), sub_data.size());
 		current_input_buffer.data_size += sub_data.size();
 	}
-
-	if (partial)
-		return;
-
-	jobs.push([=, idx = current_input_buffer.idx, data_size = current_input_buffer.data_size, mc = media_codec.get()]() {
-		uint64_t timestamp = frame_index * 10'000;
-		auto status = AMediaCodec_queueInputBuffer(mc, idx, 0, data_size, timestamp, 0);
-		if (status != AMEDIA_OK)
-			spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
-			              int(status),
-			              std::string(magic_enum::enum_name(status)).c_str());
-		return false;
-	});
-	current_input_buffer = input_buffer{};
 }
 
 void decoder::frame_completed(wivrn::from_headset::feedback & feedback, const wivrn::to_headset::video_stream_data_shard::timing_info_t & timing_info, const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info)
@@ -231,9 +355,19 @@ void decoder::frame_completed(wivrn::from_headset::feedback & feedback, const wi
 			scene->send_feedback(feedback);
 	}
 
+	auto f = std::make_shared<wivrn::from_headset::feedback>(feedback);
+
+	jobs->push_input(
+	        f,
+	        media_codec.get(),
+	        current_input_buffer.idx,
+	        current_input_buffer.data_size,
+	        current_input_buffer.frame_index);
+	current_input_buffer = input_buffer{};
+
 	// nothing required for decoder, mediacodec will callback when done
 	frame_infos.push(frame_info{
-	        .feedback = feedback,
+	        .feedback = std::move(f),
 	        .timing_info = timing_info,
 	        .view_info = view_info,
 	});
@@ -267,9 +401,9 @@ void decoder::on_image_available(AImageReader * reader)
 		check(AImage_getTimestamp(image.get(), &fake_timestamp_ns), "AImage_getTimestamp");
 		uint64_t frame_index = (fake_timestamp_ns + 5'000'000) / (10'000'000);
 
-		frame_infos.drop_until([frame_index](auto & x) { return x.feedback.frame_index >= frame_index; });
+		frame_infos.drop_until([frame_index](auto & x) { return x.feedback->frame_index >= frame_index; });
 
-		auto info = frame_infos.pop_if([frame_index](auto & x) { return x.feedback.frame_index == frame_index; });
+		auto info = frame_infos.pop_if([frame_index](auto & x) { return x.feedback->frame_index == frame_index; });
 
 		if (!info)
 		{
@@ -277,12 +411,12 @@ void decoder::on_image_available(AImageReader * reader)
 			return;
 		}
 
-		assert(info->feedback.frame_index == frame_index);
+		assert(info->feedback->frame_index == frame_index);
 
 		auto vk_data = map_hardware_buffer(image.get());
 
 		auto handle = std::make_shared<decoder::blit_handle>(
-		        info->feedback,
+		        *info->feedback,
 		        info->timing_info,
 		        info->view_info,
 		        vk_data->image_view,
@@ -476,11 +610,11 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 void decoder::on_media_error(AMediaCodec *, void * userdata, media_status_t error, int32_t actionCode, const char * detail)
 {
 	spdlog::warn("Mediacodec error: {}", detail);
+	auto self = (decoder *)userdata;
 
 	if (error == AMEDIA_ERROR_MALFORMED)
 	{
 		// Send an empty feedback packet, encoder will know we are lost
-		auto self = (decoder *)userdata;
 		if (auto scene = self->weak_scene.lock())
 			scene->send_feedback(
 			        wivrn::from_headset::feedback{
@@ -505,15 +639,7 @@ void decoder::on_media_input_available(AMediaCodec * media_codec, void * userdat
 void decoder::on_media_output_available(AMediaCodec * media_codec, void * userdata, int32_t index, AMediaCodecBufferInfo * bufferInfo)
 {
 	auto self = (decoder *)userdata;
-	self->jobs.push([=]() {
-		auto status = AMediaCodec_releaseOutputBuffer(media_codec, index, true);
-		// will trigger on_image_available through ImageReader
-		if (status != AMEDIA_OK)
-			spdlog::error("AMediaCodec_releaseOutputBuffer: MediaCodec error {}({})",
-			              int(status),
-			              std::string(magic_enum::enum_name(status)).c_str());
-		return false;
-	});
+	self->jobs->push_output(media_codec, index);
 }
 
 void decoder::blit_handle::deleter::operator()(AImage * aimage)
