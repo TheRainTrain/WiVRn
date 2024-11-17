@@ -29,6 +29,7 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <mutex>
+#include <queue>
 #include <ranges>
 #include <spdlog/spdlog.h>
 #include <thread>
@@ -86,6 +87,14 @@ class media_codec_access
 		size_t buffer_idx;
 		size_t data_size;
 		uint64_t frame_index;
+
+		struct compare
+		{
+			bool operator()(const input_job & a, const input_job & b)
+			{
+				return a.frame_index > b.frame_index;
+			}
+		};
 	};
 	struct output_job
 	{
@@ -95,7 +104,7 @@ class media_codec_access
 	std::mutex mutex;
 	std::condition_variable cv;
 	bool exit_request = false;
-	std::deque<input_job> input_jobs;
+	std::priority_queue<input_job, std::vector<input_job>, input_job::compare> input_jobs;
 	std::deque<output_job> output_jobs;
 	std::thread input;
 	std::thread output;
@@ -134,8 +143,8 @@ media_codec_access::media_codec_access()
 				        cv.wait(lock);
 			        if (not input_jobs.empty())
 			        {
-				        auto job = input_jobs.front();
-				        input_jobs.pop_front();
+				        auto job = input_jobs.top();
+				        input_jobs.pop();
 				        lock.unlock();
 
 				        if (exit_request)
@@ -186,7 +195,7 @@ media_codec_access::~media_codec_access()
 {
 	{
 		std::unique_lock lock(mutex);
-		input_jobs.clear();
+		input_jobs = decltype(input_jobs)();
 		output_jobs.clear();
 		exit_request = true;
 		cv.notify_all();
@@ -211,7 +220,14 @@ std::shared_ptr<media_codec_access> media_codec_access::get()
 void media_codec_access::stop(AMediaCodec * media_codec)
 {
 	std::unique_lock lock(mutex);
-	std::erase_if(input_jobs, [=](auto & j) { return j.media_codec == media_codec; });
+	decltype(input_jobs) jobs;
+	for (; not input_jobs.empty(); input_jobs.pop())
+	{
+		const auto & top = input_jobs.top();
+		if (top.media_codec != media_codec)
+			jobs.push(top);
+	}
+	input_jobs = std::move(jobs);
 	std::erase_if(output_jobs, [=](auto & j) { return j.media_codec == media_codec; });
 }
 
@@ -223,7 +239,7 @@ void media_codec_access::push_input(
         uint64_t frame_index)
 {
 	std::unique_lock lock(mutex);
-	input_jobs.emplace_back(feedback, media_codec, buffer_idx, data_size, frame_index);
+	input_jobs.emplace(feedback, media_codec, buffer_idx, data_size, frame_index);
 	cv.notify_all();
 }
 
