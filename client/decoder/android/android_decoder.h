@@ -19,9 +19,9 @@
 
 #pragma once
 
-#include "utils/sync_queue.h"
 #include "wivrn_packets.h"
 #include <memory>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 
@@ -60,15 +60,13 @@ namespace wivrn::android
 class media_codec_access;
 class decoder
 {
+	friend class media_codec_access;
+
 public:
 	struct mapped_hardware_buffer;
 
 	struct blit_handle
 	{
-		struct deleter
-		{
-			void operator()(AImage *);
-		};
 		wivrn::from_headset::feedback feedback;
 		wivrn::to_headset::video_stream_data_shard::timing_info_t timing_info;
 		wivrn::to_headset::video_stream_data_shard::view_info_t view_info;
@@ -104,8 +102,13 @@ private:
 
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID vkGetAndroidHardwareBufferPropertiesANDROID;
 
-	void on_image_available(AImageReader * reader);
-	static void on_image_available(void * context, AImageReader * reader);
+	struct frame_info
+	{
+		wivrn::from_headset::feedback feedback;
+		wivrn::to_headset::video_stream_data_shard::timing_info_t timing_info;
+		wivrn::to_headset::video_stream_data_shard::view_info_t view_info;
+	};
+	void on_image_available(AImage_ptr, frame_info);
 
 	struct input_buffer
 	{
@@ -116,21 +119,7 @@ private:
 		uint8_t * data = nullptr;
 	};
 
-	utils::sync_queue<input_buffer> input_buffers;
 	input_buffer current_input_buffer; // Only accessed in network thread
-
-	struct frame_info
-	{
-		std::shared_ptr<wivrn::from_headset::feedback> feedback;
-		wivrn::to_headset::video_stream_data_shard::timing_info_t timing_info;
-		wivrn::to_headset::video_stream_data_shard::view_info_t view_info;
-	};
-	utils::sync_queue<frame_info> frame_infos;
-
-	static void on_media_error(AMediaCodec *, void * userdata, media_status_t error, int32_t actionCode, const char * detail);
-	static void on_media_format_changed(AMediaCodec *, void * userdata, AMediaFormat *);
-	static void on_media_input_available(AMediaCodec *, void * userdata, int32_t index);
-	static void on_media_output_available(AMediaCodec *, void * userdata, int32_t index, AMediaCodecBufferInfo * bufferInfo);
 
 	std::unordered_map<AHardwareBuffer *, std::shared_ptr<mapped_hardware_buffer>> hardware_buffer_map;
 	vk::raii::RenderPass renderpass = nullptr;

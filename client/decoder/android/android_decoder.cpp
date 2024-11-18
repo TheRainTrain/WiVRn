@@ -31,6 +31,7 @@
 #include <mutex>
 #include <queue>
 #include <ranges>
+#include <semaphore>
 #include <spdlog/spdlog.h>
 #include <thread>
 #include <vulkan/vulkan.hpp>
@@ -82,57 +83,51 @@ class media_codec_access
 {
 	struct input_job
 	{
-		std::shared_ptr<wivrn::from_headset::feedback> feedback;
-		AMediaCodec * media_codec;
+		decoder * decoder;
+		decoder::frame_info info;
 		size_t buffer_idx;
 		size_t data_size;
-		uint64_t frame_index;
 
 		struct compare
 		{
 			bool operator()(const input_job & a, const input_job & b)
 			{
-				return a.frame_index > b.frame_index;
+				return a.info.feedback.frame_index > b.info.feedback.frame_index;
 			}
 		};
-	};
-	struct output_job
-	{
-		AMediaCodec * media_codec;
-		size_t buffer_idx;
 	};
 	std::mutex mutex;
 	std::condition_variable cv;
 	bool exit_request = false;
+	std::binary_semaphore image_ready{0};
 	std::priority_queue<input_job, std::vector<input_job>, input_job::compare> input_jobs;
-	std::deque<output_job> output_jobs;
-	std::thread input;
-	std::thread output;
+	std::thread worker;
 
 	media_codec_access();
 
 public:
 	~media_codec_access();
 	static std::shared_ptr<media_codec_access> get();
-	void stop(AMediaCodec *);
+	void stop(const decoder &);
 
 	// schedule a call to AMediaCodec_queueInputBuffer
 	void push_input(
-	        std::shared_ptr<wivrn::from_headset::feedback> feedback,
-	        AMediaCodec * media_codec,
+	        decoder *,
+	        decoder::frame_info info,
 	        size_t buffer_idx,
-	        size_t data_size,
-	        uint64_t frame_index);
-	// schedule a call to AMediaCodec_releaseOutputBuffer
-	void push_output(
-	        AMediaCodec * media_codec,
-	        size_t buffer_idx);
+	        size_t data_size);
+
+	void on_image_ready()
+	{
+		spdlog::info("image ready");
+		image_ready.release();
+	}
 };
 
 media_codec_access::media_codec_access()
 {
-	input = utils::named_thread(
-	        "queueInputBuffer",
+	worker = utils::named_thread(
+	        "decoder",
 	        [this]() {
 		        while (true)
 		        {
@@ -147,45 +142,75 @@ media_codec_access::media_codec_access()
 				        input_jobs.pop();
 				        lock.unlock();
 
-				        if (exit_request)
-					        return;
-				        job.feedback->sent_to_decoder = application::now();
+				        auto media_codec = job.decoder->media_codec.get();
+
+				        job.info.feedback.sent_to_decoder = application::now();
 				        auto status = AMediaCodec_queueInputBuffer(
-				                job.media_codec,
+				                media_codec,
 				                job.buffer_idx,
 				                0,
 				                job.data_size,
-				                job.frame_index * 10'000,
+				                job.info.feedback.frame_index * 10'000,
 				                0);
 				        if (status != AMEDIA_OK)
+				        {
 					        spdlog::error("AMediaCodec_queueInputBuffer: MediaCodec error {}({})",
 					                      int(status),
 					                      std::string(magic_enum::enum_name(status)).c_str());
-			        }
-		        }
-	        });
-	output = utils::named_thread(
-	        "releaseOutputBuffer",
-	        [this]() {
-		        while (true)
-		        {
-			        std::unique_lock lock(mutex);
-			        if (exit_request)
-				        return;
-			        if (output_jobs.empty())
-				        cv.wait(lock);
-			        if (not output_jobs.empty())
-			        {
-				        auto job = output_jobs.front();
-				        output_jobs.pop_front();
-				        lock.unlock();
+					        continue;
+				        }
 
-				        auto status = AMediaCodec_releaseOutputBuffer(job.media_codec, job.buffer_idx, true);
-				        // will trigger on_image_available through ImageReader
+				        ssize_t decoded = -1;
+				        while (decoded == -1)
+				        {
+					        AMediaCodecBufferInfo info{};
+					        decoded = AMediaCodec_dequeueOutputBuffer(media_codec, &info, -1);
+
+					        // discard buffers without data (format changed)
+					        if (info.size == 0)
+					        {
+						        AMediaCodec_releaseOutputBuffer(media_codec, decoded, false);
+						        decoded = -1;
+					        }
+				        }
+
+				        status = AMediaCodec_releaseOutputBuffer(media_codec, decoded, true);
 				        if (status != AMEDIA_OK)
+				        {
 					        spdlog::error("AMediaCodec_releaseOutputBuffer: MediaCodec error {}({})",
 					                      int(status),
 					                      std::string(magic_enum::enum_name(status)).c_str());
+					        continue;
+				        }
+
+				        // Wait for image to be rendered
+				        image_ready.acquire();
+				        if (exit_request)
+					        return;
+
+				        AImage_ptr image;
+				        AImage * tmp;
+				        status = AImageReader_acquireNextImage(job.decoder->image_reader.get(), &tmp);
+				        if (status != AMEDIA_OK)
+				        {
+					        spdlog::error("AImageReader_acquireNextImage: MediaCodec error {}({})",
+					                      int(status),
+					                      std::string(magic_enum::enum_name(status)).c_str());
+					        continue;
+				        }
+				        image.reset(tmp);
+
+#ifndef NDEBUG
+				        int64_t ts;
+				        AImage_getTimestamp(tmp, &ts);
+				        ts = (ts + 5'000'000) / 10'000'000;
+				        if (ts != job.info.feedback.frame_index)
+				        {
+					        spdlog::error("invalid frame index, got {} expected {}", ts, job.info.feedback.frame_index);
+				        }
+#endif
+
+				        job.decoder->on_image_available(std::move(image), job.info);
 			        }
 		        }
 	        });
@@ -196,12 +221,11 @@ media_codec_access::~media_codec_access()
 	{
 		std::unique_lock lock(mutex);
 		input_jobs = decltype(input_jobs)();
-		output_jobs.clear();
 		exit_request = true;
 		cv.notify_all();
+		image_ready.release();
 	}
-	output.join();
-	input.join();
+	worker.join();
 }
 
 std::shared_ptr<media_codec_access> media_codec_access::get()
@@ -217,38 +241,27 @@ std::shared_ptr<media_codec_access> media_codec_access::get()
 	return s;
 }
 
-void media_codec_access::stop(AMediaCodec * media_codec)
+void media_codec_access::stop(const decoder & decoder)
 {
 	std::unique_lock lock(mutex);
 	decltype(input_jobs) jobs;
 	for (; not input_jobs.empty(); input_jobs.pop())
 	{
 		const auto & top = input_jobs.top();
-		if (top.media_codec != media_codec)
+		if (top.decoder != &decoder)
 			jobs.push(top);
 	}
 	input_jobs = std::move(jobs);
-	std::erase_if(output_jobs, [=](auto & j) { return j.media_codec == media_codec; });
 }
 
 void media_codec_access::push_input(
-        std::shared_ptr<wivrn::from_headset::feedback> feedback,
-        AMediaCodec * media_codec,
+        decoder * decoder,
+        decoder::frame_info info,
         size_t buffer_idx,
-        size_t data_size,
-        uint64_t frame_index)
+        size_t data_size)
 {
 	std::unique_lock lock(mutex);
-	input_jobs.emplace(feedback, media_codec, buffer_idx, data_size, frame_index);
-	cv.notify_all();
-}
-
-void media_codec_access::push_output(
-        AMediaCodec * media_codec,
-        size_t buffer_idx)
-{
-	std::unique_lock lock(mutex);
-	output_jobs.emplace_back(media_codec, buffer_idx);
+	input_jobs.emplace(decoder, info, buffer_idx, data_size);
 	cv.notify_all();
 }
 
@@ -281,50 +294,44 @@ decoder::decoder(
 	      "AImageReader_newWithUsage");
 	image_reader.reset(ir, AImageReader_deleter{});
 
-	AImageReader_ImageListener listener{this, on_image_available};
-	check(AImageReader_setImageListener(ir, &listener), "AImageReader_setImageListener");
-
 	vkGetAndroidHardwareBufferPropertiesANDROID =
 	        application::get_vulkan_proc<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
 	                "vkGetAndroidHardwareBufferPropertiesANDROID");
-	{
-		AMediaFormat_ptr format(AMediaFormat_new());
-		AMediaFormat_setString(format.get(), AMEDIAFORMAT_KEY_MIME, mime(description.codec));
-		// AMediaFormat_setInt32(format.get(), "vendor.qti-ext-dec-low-latency.enable", 1); // Qualcomm low
-		// latency mode
-		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_WIDTH, description.video_width);
-		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_HEIGHT, description.video_height);
-		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_OPERATING_RATE, std::ceil(fps));
-		AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_PRIORITY, 0);
+	AMediaFormat_ptr format(AMediaFormat_new());
+	AMediaFormat_setString(format.get(), AMEDIAFORMAT_KEY_MIME, mime(description.codec));
+	// AMediaFormat_setInt32(format.get(), "vendor.qti-ext-dec-low-latency.enable", 1); // Qualcomm low
+	// latency mode
+	AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_WIDTH, description.video_width);
+	AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_HEIGHT, description.video_height);
+	AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_OPERATING_RATE, std::ceil(fps));
+	AMediaFormat_setInt32(format.get(), AMEDIAFORMAT_KEY_PRIORITY, 0);
 
-		media_codec.reset(AMediaCodec_createDecoderByType(mime(description.codec)));
+	media_codec.reset(AMediaCodec_createDecoderByType(mime(description.codec)));
 
-		if (not media_codec)
-			throw std::runtime_error(std::string("Cannot create decoder for MIME type ") + mime(description.codec));
+	if (not media_codec)
+		throw std::runtime_error(std::string("Cannot create decoder for MIME type ") + mime(description.codec));
 
-		char * codec_name;
-		check(AMediaCodec_getName(media_codec.get(), &codec_name), "AMediaCodec_getName");
-		spdlog::info("Created MediaCodec decoder \"{}\"", codec_name);
-		AMediaCodec_releaseName(media_codec.get(), codec_name);
+	AImageReader_ImageListener listener{
+	        .context = jobs.get(),
+	        .onImageAvailable = [](void * context, AImageReader * reader) {
+		        ((media_codec_access *)(context))->on_image_ready();
+	        }};
 
-		ANativeWindow * window;
+	AImageReader_setImageListener(image_reader.get(), &listener);
 
-		check(AImageReader_getWindow(image_reader.get(), &window), "AImageReader_getWindow");
+	char * codec_name;
+	check(AMediaCodec_getName(media_codec.get(), &codec_name), "AMediaCodec_getName");
+	spdlog::info("Created MediaCodec decoder \"{}\"", codec_name);
+	AMediaCodec_releaseName(media_codec.get(), codec_name);
 
-		AMediaCodecOnAsyncNotifyCallback callback{
-		        .onAsyncInputAvailable = decoder::on_media_input_available,
-		        .onAsyncOutputAvailable = decoder::on_media_output_available,
-		        .onAsyncFormatChanged = decoder::on_media_format_changed,
-		        .onAsyncError = decoder::on_media_error,
-		};
-		check(AMediaCodec_setAsyncNotifyCallback(media_codec.get(), callback, this),
-		      "AMediaCodec_setAsyncNotifyCallback");
+	ANativeWindow * window;
 
-		check(AMediaCodec_configure(media_codec.get(), format.get(), window, nullptr /* crypto */, 0 /* flags */),
-		      "AMediaCodec_configure");
+	check(AImageReader_getWindow(image_reader.get(), &window), "AImageReader_getWindow");
 
-		check(AMediaCodec_start(media_codec.get()), "AMediaCodec_start");
-	}
+	check(AMediaCodec_configure(media_codec.get(), format.get(), window, nullptr /* crypto */, 0 /* flags */),
+	      "AMediaCodec_configure");
+
+	check(AMediaCodec_start(media_codec.get()), "AMediaCodec_start");
 }
 
 decoder::~decoder()
@@ -332,16 +339,21 @@ decoder::~decoder()
 	if (media_codec)
 	{
 		AMediaCodec_stop(media_codec.get());
-		jobs->stop(media_codec.get());
+		jobs->stop(*this);
 	}
-	input_buffers.close();
 	spdlog::info("decoder::~decoder");
 }
 
 void decoder::push_data(std::span<std::span<const uint8_t>> data, uint64_t frame_index, bool partial)
 {
 	if (current_input_buffer.data == nullptr)
-		current_input_buffer = input_buffers.pop();
+	{
+		current_input_buffer.idx = AMediaCodec_dequeueInputBuffer(media_codec.get(), -1);
+		current_input_buffer.data = AMediaCodec_getInputBuffer(media_codec.get(),
+		                                                       current_input_buffer.idx,
+		                                                       &current_input_buffer.capacity);
+		current_input_buffer.data_size = 0;
+	}
 	else if (current_input_buffer.frame_index != frame_index)
 	{
 		// Reuse the input buffer, discard existing data
@@ -374,73 +386,33 @@ void decoder::frame_completed(wivrn::from_headset::feedback & feedback, const wi
 	auto f = std::make_shared<wivrn::from_headset::feedback>(feedback);
 
 	jobs->push_input(
-	        f,
-	        media_codec.get(),
+	        this,
+	        frame_info{
+	                .feedback = feedback,
+	                .timing_info = timing_info,
+	                .view_info = view_info,
+	        },
 	        current_input_buffer.idx,
-	        current_input_buffer.data_size,
-	        current_input_buffer.frame_index);
+	        current_input_buffer.data_size);
 	current_input_buffer = input_buffer{};
-
-	// nothing required for decoder, mediacodec will callback when done
-	frame_infos.push(frame_info{
-	        .feedback = std::move(f),
-	        .timing_info = timing_info,
-	        .view_info = view_info,
-	});
 }
 
-void decoder::on_image_available(void * context, AImageReader * reader)
+void decoder::on_image_available(AImage_ptr aimage, frame_info info)
 {
 	try
 	{
-		static_cast<decoder *>(context)->on_image_available(reader);
-	}
-	catch (std::exception & e)
-	{
-		spdlog::error("Exception in decoder::on_image_available: {}", e.what());
-	}
-}
-
-void decoder::on_image_available(AImageReader * reader)
-{
-	assert(reader == image_reader.get());
-	// Executed on image reader thread
-
-	decltype(blit_handle::aimage) image;
-	try
-	{
-		AImage * tmp;
-		check(AImageReader_acquireLatestImage(image_reader.get(), &tmp), "AImageReader_acquireLatestImage");
-		image.reset(tmp);
-
-		int64_t fake_timestamp_ns;
-		check(AImage_getTimestamp(image.get(), &fake_timestamp_ns), "AImage_getTimestamp");
-		uint64_t frame_index = (fake_timestamp_ns + 5'000'000) / (10'000'000);
-
-		frame_infos.drop_until([frame_index](auto & x) { return x.feedback->frame_index >= frame_index; });
-
-		auto info = frame_infos.pop_if([frame_index](auto & x) { return x.feedback->frame_index == frame_index; });
-
-		if (!info)
-		{
-			spdlog::warn("No frame info for frame {}, dropping frame", frame_index);
-			return;
-		}
-
-		assert(info->feedback->frame_index == frame_index);
-
-		auto vk_data = map_hardware_buffer(image.get());
+		auto vk_data = map_hardware_buffer(aimage.get());
 
 		auto handle = std::make_shared<decoder::blit_handle>(
-		        *info->feedback,
-		        info->timing_info,
-		        info->view_info,
+		        info.feedback,
+		        info.timing_info,
+		        info.view_info,
 		        vk_data->image_view,
 		        *vk_data->vimage,
 		        &vk_data->layout,
 		        vk_data,
 		        image_reader,
-		        std::move(image));
+		        std::move(aimage));
 
 		if (auto scene = weak_scene.lock())
 			scene->push_blit_handle(accumulator, std::move(handle));
@@ -621,46 +593,6 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 
 	hardware_buffer_map[hardware_buffer] = handle;
 	return handle;
-}
-
-void decoder::on_media_error(AMediaCodec *, void * userdata, media_status_t error, int32_t actionCode, const char * detail)
-{
-	spdlog::warn("Mediacodec error: {}", detail);
-	auto self = (decoder *)userdata;
-
-	if (error == AMEDIA_ERROR_MALFORMED)
-	{
-		// Send an empty feedback packet, encoder will know we are lost
-		if (auto scene = self->weak_scene.lock())
-			scene->send_feedback(
-			        wivrn::from_headset::feedback{
-			                .stream_index = self->stream_index});
-	}
-}
-void decoder::on_media_format_changed(AMediaCodec *, void * userdata, AMediaFormat *)
-{
-	spdlog::info("Mediacodec format changed");
-}
-void decoder::on_media_input_available(AMediaCodec * media_codec, void * userdata, int32_t index)
-{
-	auto self = (decoder *)userdata;
-	size_t size;
-	uint8_t * buffer = AMediaCodec_getInputBuffer(media_codec, index, &size);
-	self->input_buffers.push({
-	        .idx = index,
-	        .capacity = size,
-	        .data = buffer,
-	});
-}
-void decoder::on_media_output_available(AMediaCodec * media_codec, void * userdata, int32_t index, AMediaCodecBufferInfo * bufferInfo)
-{
-	auto self = (decoder *)userdata;
-	self->jobs->push_output(media_codec, index);
-}
-
-void decoder::blit_handle::deleter::operator()(AImage * aimage)
-{
-	AImage_delete(aimage);
 }
 
 static bool hardware_accelerated(AMediaCodec * media_codec)
