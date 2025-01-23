@@ -146,6 +146,8 @@ jobs:
         --preset everything
         -DWIVRN_BUILD_DASHBOARD=OFF
         -DWIVRN_BUILD_DISSECTOR=OFF
+        -DGIT_DESC=v0.22
+        -DWIVRN_CSS=images/wivrn-release.css
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
