@@ -197,15 +197,22 @@ static void fill_defaults(wivrn_vk_bundle & bundle, const std::vector<wivrn::vid
 		}
 		else
 		{
-#if WIVRN_USE_VAAPI
-			config.name = encoder_vaapi;
-#elif WIVRN_USE_X264
-			U_LOG_W("ffmpeg support not compiled, vaapi encoder not available");
-			config.name = encoder_x264;
-			config.codec = h264;
-#else
-			U_LOG_E("no suitable encoder available (compile with x264 or nvenc support)");
+#if WIVRN_USE_VULKAN_ENCODE
+			if (std::ranges::any_of(bundle.device_extensions, [](std::string_view ext) { return ext == VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME; }))
+				config.name = encoder_vulkan;
+			else
 #endif
+			{
+#if WIVRN_USE_VAAPI
+				config.name = encoder_vaapi;
+#elif WIVRN_USE_X264
+				U_LOG_W("ffmpeg support not compiled, vaapi encoder not available");
+				config.name = encoder_x264;
+				config.codec = h264;
+#else
+				U_LOG_E("no suitable encoder available (compile with x264 or nvenc support)");
+#endif
+			}
 		}
 	}
 
