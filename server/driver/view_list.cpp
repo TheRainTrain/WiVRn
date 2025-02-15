@@ -24,6 +24,9 @@
 namespace wivrn
 {
 
+view_list::view_list() :
+        history("view") {}
+
 tracked_views view_list::interpolate(const tracked_views & a, const tracked_views & b, float t)
 {
 	tracked_views result = a;

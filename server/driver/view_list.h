@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "pose_list.h"
+#include "history.h"
 
 #include <array>
 #include <openxr/openxr.h>
@@ -38,6 +38,7 @@ struct tracked_views
 class view_list : public history<view_list, tracked_views>
 {
 public:
+	view_list();
 	static tracked_views interpolate(const tracked_views & a, const tracked_views & b, float t);
 	static tracked_views extrapolate(const tracked_views & a, const tracked_views & b, int64_t ta, int64_t tb, int64_t t);
 

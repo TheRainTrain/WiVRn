@@ -24,6 +24,7 @@
 #include "math/m_vec3.h"
 #include "xrt/xrt_defines.h"
 #include "xrt_cast.h"
+#include <magic_enum.hpp>
 
 using namespace xrt::auxiliary::math;
 
@@ -62,6 +63,10 @@ xrt_space_relation pose_list::extrapolate(const xrt_space_relation & a, const xr
 
 	return res;
 }
+
+pose_list::pose_list(device_id id) :
+        history(std::string(magic_enum::enum_name(id))),
+        device(id) {}
 
 bool pose_list::update_tracking(const from_headset::tracking & tracking, const clock_offset & offset)
 {

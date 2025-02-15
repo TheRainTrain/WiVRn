@@ -36,6 +36,7 @@ public:
 	static xrt_hand_joint_set extrapolate(const xrt_hand_joint_set & a, const xrt_hand_joint_set & b, int64_t ta, int64_t tb, int64_t t);
 
 	hand_joints_list(int hand_id) :
+	        history(hand_id == 0 ? "left hand" : "right hand"),
 	        hand_id(hand_id) {}
 
 	bool update_tracking(const wivrn::from_headset::hand_tracking & tracking, const clock_offset & offset);

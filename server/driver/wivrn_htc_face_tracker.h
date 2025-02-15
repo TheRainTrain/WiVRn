@@ -47,6 +47,9 @@ struct wivrn_htc_face_data
 class htc_face_list : public history<htc_face_list, wivrn_htc_face_data>
 {
 public:
+	htc_face_list() :
+	        history("face tracker") {}
+
 	static wivrn_htc_face_data interpolate(const wivrn_htc_face_data & a, const wivrn_htc_face_data & b, float t)
 	{
 		wivrn_htc_face_data result = b;

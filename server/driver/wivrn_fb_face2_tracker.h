@@ -52,6 +52,9 @@ struct wivrn_fb_face2_data
 class fb_face2_list : public history<fb_face2_list, wivrn_fb_face2_data>
 {
 public:
+	fb_face2_list() :
+	        history("face tracker") {}
+
 	static wivrn_fb_face2_data interpolate(const wivrn_fb_face2_data & a, const wivrn_fb_face2_data & b, float t)
 	{
 		if (not a.is_valid)

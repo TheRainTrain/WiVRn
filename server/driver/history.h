@@ -20,7 +20,10 @@
 #pragma once
 
 #include "clock_offset.h"
+
 #include "os/os_time.h"
+#include "util/u_logging.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <mutex>
@@ -41,10 +44,11 @@ class history
 
 	std::mutex mutex;
 	XrTime last_request;
+	const std::string name;
 
 protected:
-	history() :
-	        last_request(os_monotonic_get_ns()) {}
+	history(std::string name) :
+	        last_request(os_monotonic_get_ns()), name(std::move(name)) {}
 
 	// return true if object is active (last request is not too old)
 	bool add_sample(XrTime produced_timestamp, XrTime timestamp, const Data & sample, const clock_offset & offset)
@@ -123,6 +127,12 @@ public:
 		{
 			if (at_timestamp_ns > before->at_timestamp_ns + U_TIME_1S_IN_NS)
 				return {};
+			if (at_timestamp_ns > before->at_timestamp_ns + U_TIME_1MS_IN_NS)
+				U_LOG_W("prediction exceeded by %ldµs for %s, age: %ldµs extrapolation: %ldµs",
+				        (at_timestamp_ns - before->at_timestamp_ns) / 1'000,
+				        name.c_str(),
+				        (last_request - before->produced_timestamp) / 1'000,
+				        (at_timestamp_ns - before->produced_timestamp) / 1'000);
 			return {ex, *before};
 		}
 
